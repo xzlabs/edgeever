@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, session, net, protocol, shell, dialog, safeStorage, clipboard, ClipboardItem, powerMonitor, desktopCapturer, screen } from "electron";
+import { app, BrowserWindow, Menu, Tray, globalShortcut, nativeImage, ipcMain, session, net, protocol, shell, dialog, safeStorage, clipboard, ClipboardItem, powerMonitor, desktopCapturer, screen } from "electron";
 import { createReadStream, existsSync } from "node:fs";
 import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -31,6 +31,7 @@ import {
 import { userDataDirectoryFromArguments } from "./user-data-directory.mjs";
 import { isAllowedPrintPreviewUrl } from "./window-open-policy.mjs";
 import { showWindow } from "./window-visibility.mjs";
+import { globalShortcutAccelerator, normalizeGlobalShortcutBinding, replaceGlobalShortcut, toggleMainWindow } from "./global-shortcut.mjs";
 import { trayIconPath } from "./tray-icon.mjs";
 import { writeImageClipboard, writeRichClipboard, writeTextClipboard } from "./clipboard-write.mjs";
 import { captureScreenToNote, createScreenshotCaptureGuard, screenshotImportIpcPayload, writeScreenshotTempPath } from "./screenshot-capture.mjs";
@@ -48,13 +49,6 @@ import {
 } from "./windows-update-trust.mjs";
 import electronUpdater from "electron-updater";
 import { createPluginPublicNetworkRuntime } from "./plugin-public-network.mjs";
-import { createYtDlpManager, startYtDlpMaintenance } from "./yt-dlp-tool.mjs";
-import {
-  createSpeechTranscriptionRunner,
-  readCookieBrowserPreference,
-  startSpeechTranscription,
-  writeCookieBrowserPreference,
-} from "./speech-transcription.mjs";
 import { createAiDirectRuntime } from "./ai-direct.mjs";
 import { createAcpHostRuntime, registerAcpIpc } from "./acp-host.mjs";
 import { shouldQuitAfterAllWindowsClosed } from "./window-lifecycle.mjs";
@@ -88,7 +82,7 @@ const requestedUserDataDirectory = linuxUpdateTestMode
 if (requestedUserDataDirectory) app.setPath("userData", requestedUserDataDirectory);
 
 const currentDirectory = fileURLToPath(new URL(".", import.meta.url));
-const projectRoot = join(currentDirectory, "../../..");
+const projectRoot = join(currentDirectory, app.isPackaged ? "../../.." : "../../../..");
 /**
  * Force Dock to use our multi-resolution app icon. Bundle Info.plist is still
  * the primary source; this covers cases where Launch Services/Dock cache a
@@ -134,10 +128,6 @@ let updateState = "idle";
 let updateCheckInFlight = null;
 let updateDownloadInFlight = null;
 let updateCheckTimer = null;
-let stopYtDlpMaintenance = null;
-let stopSpeechTranscription = null;
-let ytDlpMaintenanceTimer = null;
-let ytDlpManager = null;
 let lastUpdateCheckAt = 0;
 let downloadedUpdateVersion = null;
 let promptedUpdateVersion = null;
@@ -180,13 +170,83 @@ const updateCheckIntervalMs = 60 * 60 * 1_000;
 const updateCheckFocusThrottleMs = 15 * 60 * 1_000;
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 const windowStatePath = () => join(app.getPath("userData"), "window-state.json");
+const globalShortcutPath = () => join(app.getPath("userData"), "global-shortcut.json");
 const instanceUrlPath = () => join(app.getPath("userData"), "instance-url");
 const sessionTokenPath = () => join(app.getPath("userData"), "session-token");
 const crashMarkerPath = () => join(app.getPath("userData"), "last-session-active");
 const installationMarkerPath = () => join(app.getPath("userData"), "installation-confirmed");
 const logPath = () => join(app.getPath("userData"), "logs", "desktop.log");
-const videoCookieBrowserPath = () => join(app.getPath("userData"), "video-cookie-browser.json");
 let desktopSessionToken = "";
+let configuredGlobalShortcut = null;
+let registeredGlobalShortcut = null;
+let globalShortcutUpdate = Promise.resolve();
+const globalShortcutState = () => ({
+  binding: configuredGlobalShortcut,
+  registered: Boolean(registeredGlobalShortcut && globalShortcut.isRegistered(globalShortcutAccelerator(registeredGlobalShortcut))),
+});
+const persistGlobalShortcut = async (binding) => {
+  const temporaryPath = `${globalShortcutPath()}.tmp`;
+  try {
+    await writeFile(temporaryPath, JSON.stringify({ binding }), { mode: 0o600 });
+    await rename(temporaryPath, globalShortcutPath());
+  } catch (error) {
+    await unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
+};
+const toggleWindowFromGlobalShortcut = () => toggleMainWindow({
+  window: mainWindow,
+  showWindow,
+  activateApp: process.platform === "darwin" ? () => app.show() : undefined,
+});
+const loadGlobalShortcut = async () => {
+  try {
+    const stored = JSON.parse(await readFile(globalShortcutPath(), "utf8"));
+    configuredGlobalShortcut = normalizeGlobalShortcutBinding(stored?.binding);
+    if (configuredGlobalShortcut === undefined) configuredGlobalShortcut = null;
+  } catch {
+    configuredGlobalShortcut = null;
+  }
+  const accelerator = globalShortcutAccelerator(configuredGlobalShortcut);
+  if (!accelerator) return;
+  try {
+    if (globalShortcut.register(accelerator, toggleWindowFromGlobalShortcut)) {
+      registeredGlobalShortcut = configuredGlobalShortcut;
+      void writeDiagnostic("global-shortcut.registered", { accelerator });
+    } else {
+      void writeDiagnostic("global-shortcut.registration-failed", { accelerator });
+    }
+  } catch (error) {
+    void writeDiagnostic("global-shortcut.registration-failed", {
+      accelerator,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    // Keep the preference so the user can change it when registration fails.
+  }
+};
+const setGlobalShortcut = (value) => {
+  const next = normalizeGlobalShortcutBinding(value);
+  if (next === undefined) return Promise.resolve({ ...globalShortcutState(), error: "invalid" });
+  const update = async () => {
+    const result = await replaceGlobalShortcut({
+      globalShortcut,
+      previous: registeredGlobalShortcut,
+      next,
+      callback: toggleWindowFromGlobalShortcut,
+      persist: persistGlobalShortcut,
+    });
+    if (!result.ok) {
+      void writeDiagnostic("global-shortcut.update-failed", { reason: result.reason });
+      return { ...globalShortcutState(), error: result.reason };
+    }
+    configuredGlobalShortcut = next;
+    registeredGlobalShortcut = next;
+    return globalShortcutState();
+  };
+  const result = globalShortcutUpdate.then(update, update);
+  globalShortcutUpdate = result.then(() => undefined, () => undefined);
+  return result;
+};
 const sidecarDataDirectory = (accountId = null) => {
   return accountId
     ? accountDataDirectory(app.getPath("userData"), configuredApiBaseUrl, accountId)
@@ -1375,6 +1435,7 @@ const createWindow = async () => {
   attachEditContextMenu(mainWindow.webContents);
   mainWindow.webContents.on("did-create-window", (childWindow) => attachEditContextMenu(childWindow.webContents));
   mainWindow.on("hide", syncRendererHibernate);
+  mainWindow.on("hide", () => globalShortcut.setSuspended(false));
   mainWindow.on("show", syncRendererHibernate);
   mainWindow.on("minimize", syncRendererHibernate);
   mainWindow.on("restore", syncRendererHibernate);
@@ -1403,6 +1464,7 @@ const createWindow = async () => {
     });
     rendererStartupGuard?.fail({ kind: "preload-error", message: String(error?.message || error).slice(0, 2000) });
   });
+  mainWindow.webContents.on("did-start-loading", () => globalShortcut.setSuspended(false));
   mainWindow.webContents.on("console-message", (details) => {
     if (details.level !== "error") return;
     void writeDiagnostic("renderer.console-error", {
@@ -1415,6 +1477,7 @@ const createWindow = async () => {
     void writeDiagnostic("renderer.loaded", { url: mainWindow?.webContents.getURL() || "" });
   });
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    globalShortcut.setSuspended(false);
     clearRendererUnresponsiveTimer();
     void writeDiagnostic("renderer.gone", details);
     void handleRendererProcessGone(details);
@@ -1530,15 +1593,6 @@ const startApplication = async () => {
     app.quit();
     return;
   }
-  ytDlpManager = createYtDlpManager({
-    directory: join(app.getPath("userData"), "tools"),
-    platform: process.platform,
-    arch: process.arch,
-    fetch: net.fetch.bind(net),
-    onDiagnostic: (event, details) => {
-      void writeDiagnostic(event, details);
-    },
-  });
   await loadConfiguredApiBaseUrl();
   await loadDesktopSessionToken();
   app.setAsDefaultProtocolClient("edgeever");
@@ -1554,6 +1608,7 @@ const startApplication = async () => {
   await initialSidecar.waitUntilReady();
   void writeDiagnostic("sidecar.ready", { scope: sidecarScopeKey });
   createTray();
+  await loadGlobalShortcut();
 
   ipcMain.on("desktop:local-data-reset-available-sync", (event) => {
     event.returnValue = process.platform === "darwin" && app.isPackaged && !requestedUserDataDirectory;
@@ -1572,17 +1627,19 @@ const startApplication = async () => {
   });
   ipcMain.handle("desktop:sidecar-status", () => ({ available: Boolean(sidecar), path: sidecarPath, scope: sidecarScopeKey }));
   ipcMain.handle("desktop:system-info", () => desktopRuntimeSystemInfo());
-  ipcMain.handle("desktop:yt-dlp-status", () => ytDlpManager?.status() ?? {
-    state: "idle",
-    version: null,
-    path: "",
-    errorCode: null,
-    httpStatus: null,
+  ipcMain.handle("desktop:global-shortcut", (event) => {
+    if (event.sender !== mainWindow?.webContents) return null;
+    return globalShortcutState();
   });
-  ipcMain.handle("desktop:video-cookie-browser-get", () => readCookieBrowserPreference(videoCookieBrowserPath()));
-  ipcMain.handle("desktop:video-cookie-browser-set", (_event, browser) => (
-    writeCookieBrowserPreference(videoCookieBrowserPath(), browser)
-  ));
+  ipcMain.handle("desktop:set-global-shortcut", (event, binding) => {
+    if (event.sender !== mainWindow?.webContents) return null;
+    return setGlobalShortcut(binding);
+  });
+  ipcMain.handle("desktop:capture-global-shortcut", (event, capturing) => {
+    if (event.sender !== mainWindow?.webContents || typeof capturing !== "boolean") return false;
+    globalShortcut.setSuspended(capturing);
+    return true;
+  });
   ipcMain.handle("desktop:set-account-scope", async (_event, accountId) => {
     const normalizedAccountId = typeof accountId === "string" && accountId.trim() ? accountId.trim() : null;
     const nextScopeKey = accountScopeKey(configuredApiBaseUrl, normalizedAccountId);
@@ -1947,22 +2004,6 @@ const startApplication = async () => {
   // user-visible critical path so the first installed launch opens promptly.
   await ejectMountedMacInstallers();
   await confirmMacInstallation();
-  // The standalone binary is about 35 MB. Start only after the window and the
-  // first-run installer dialog, and never await it: the workspace must stay usable.
-  ytDlpMaintenanceTimer = setTimeout(() => {
-    ytDlpMaintenanceTimer = null;
-    if (!ytDlpManager || stopYtDlpMaintenance) return;
-    stopYtDlpMaintenance = startYtDlpMaintenance(ytDlpManager, { intervalMs: updateCheckIntervalMs });
-    // Transcription waits on this same timer and is not awaited. A pass that
-    // finds nothing, or a download that fails, must not block the window.
-    stopSpeechTranscription = startSpeechTranscription(createSpeechTranscriptionRunner({
-      getSession: () => ({ baseUrl: configuredApiBaseUrl, token: desktopSessionToken }),
-      ytDlpStatus: () => ytDlpManager.status(),
-      cookieBrowser: () => readCookieBrowserPreference(videoCookieBrowserPath()),
-      audioDirectory: () => join(app.getPath("userData"), "tools", "transcript-audio"),
-    }));
-  }, 3_000);
-  ytDlpMaintenanceTimer.unref?.();
   void enableMacShareExtension({
     platform: process.platform,
     packaged: app.isPackaged,
@@ -2041,6 +2082,7 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   shutdownCleanupStarted = true;
   isQuitting = true;
+  globalShortcut.unregisterAll();
   scheduledTaskScheduler.clear();
   rendererStartupGuard?.complete();
   clearRendererUnresponsiveTimer();
@@ -2052,14 +2094,6 @@ app.on("before-quit", (event) => {
     clearInterval(updateCheckTimer);
     updateCheckTimer = null;
   }
-  if (ytDlpMaintenanceTimer) {
-    clearTimeout(ytDlpMaintenanceTimer);
-    ytDlpMaintenanceTimer = null;
-  }
-  stopYtDlpMaintenance?.();
-  stopYtDlpMaintenance = null;
-  stopSpeechTranscription?.();
-  stopSpeechTranscription = null;
   tray?.destroy();
   void (async () => {
     await stopSidecar();
