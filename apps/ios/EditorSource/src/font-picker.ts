@@ -1,4 +1,4 @@
-import { FONT_IDS, isRemoteNoteImageFont, shouldLoadFontPreview } from "@edgeever/shared/font-catalog";
+import { FONT_IDS, isRemoteNoteImageFont } from "@edgeever/shared/font-catalog";
 import { resolveNoteImageTypography, type NoteImageFontStyle, type NoteImageTheme } from "@edgeever/shared/note-image-card";
 import { prepareNoteImageAssets } from "@edgeever/shared/note-image-fonts";
 import { noteImageAssetUrls } from "@edgeever/shared/note-image-assets";
@@ -63,9 +63,8 @@ if (config && list) {
     name.textContent = item.label;
     const sample = document.createElement("span");
     const needsFont = item.id === "auto" || isRemoteNoteImageFont(item.id);
-    const previewEnabled = shouldLoadFontPreview(item.id, item.id === config.selected);
-    sample.className = needsFont && previewEnabled ? "font-status" : "font-sample";
-    sample.textContent = needsFont && previewEnabled ? config.loading : text;
+    sample.className = needsFont ? "font-status" : "font-sample";
+    sample.textContent = needsFont ? config.loading : text;
     if (!needsFont) sample.style.fontFamily = resolveNoteImageTypography(config.theme, item.id).bodyFamily;
     copy.append(name, sample);
     const check = document.createElement("span");
@@ -91,7 +90,6 @@ if (config && list) {
       observer.unobserve(entry.target);
       const row = byElement.get(entry.target as HTMLButtonElement);
       if (!row) continue;
-      if (!shouldLoadFontPreview(row.id, row.id === config.selected)) continue;
       void prepareNoteImageAssets({ theme: config.theme, fontStyle: row.id, text: row.text, urls: noteImageAssetUrls, embed: false })
         .then(() => {
           row.sample.className = "font-sample";
