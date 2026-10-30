@@ -330,7 +330,10 @@ export const PublicShareArticle = ({
   useEffect(() => {
     if (publishedBodyFont === undefined) return undefined;
     if (!publishedBodyFont) {
-      applyEditorBodyFontPreference({ choice: "system", customFamily: "" });
+      delete document.documentElement.dataset.editorBodyFont;
+      document.documentElement.style.removeProperty(
+        "--editor-body-font-family",
+      );
     } else {
       applyEditorBodyFontPreference({
         choice: publishedBodyFont,
